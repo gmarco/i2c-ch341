@@ -168,6 +168,7 @@ struct i2c_ch341_u2c {
 	int olen;			/* Output buffer length */
 	int ocount;			/* Number of enqueued messages */
 	int ilen;
+	int check_ack;
 };
 
 static uint frequency = U2C_I2C_FREQ_STD;	/* I2C clock frequency in Hz */
@@ -188,12 +189,15 @@ static int ch341_usb_transfer(struct i2c_ch341_u2c *dev)
 		return -EINVAL;
 //dev_info(&dev->interface->dev,		 "olen=%d ilen=%d, ocount=%d, obufffer=%x %x %x",dev->olen,dev->ilen,dev->ocount,dev->obuffer[0],dev->obuffer[1],dev->obuffer[2]);
 
+
 	ret = usb_bulk_msg(dev->usb_dev,
 			   usb_sndbulkpipe(dev->usb_dev, dev->ep_out),
 			   dev->obuffer, dev->olen, &actual,
 			   DEFAULT_TIMEOUT);
-dev_info(&dev->interface->dev,"ret write=%d act=%d \n",ret,actual);
-	if (dev->ilen) {
+	//print_hex_dump_bytes("obuffer ",DUMP_PREFIX_NONE,dev->obuffer,dev->olen);
+	//	dev_info(&dev->interface->dev,"after write=%d act=%d \n",ret,actual);
+	if (dev->obuffer[1]!=0x60 && !ret) {
+	 //usleep_range(30,50);
 		dev->ocount=1;
 		for (i = 0; i < dev->ocount; i++) {
 			int tmpret;
@@ -204,34 +208,32 @@ dev_info(&dev->interface->dev,"ret write=%d act=%d \n",ret,actual);
 					      dev->ibuffer,
 					      sizeof(dev->ibuffer), &actual,
 					      DEFAULT_TIMEOUT);
-//dev_info(&dev->interface->dev,"ret i=%d read=%d act=%d",i,tmpret,actual);
+			//print_hex_dump_bytes("ibuffer ",DUMP_PREFIX_NONE,dev->ibuffer,actual);
+			//dev_info(&dev->interface->dev,"after read %d %d",tmpret,actual);
+
 			/*
 			 * Stop command processing if a previous command
 			 * returned an error.
 			 * Note that we still need to retrieve all messages.
 			 */
-			if (ret < 0)
-				continue;
-			ret = tmpret;
+
+			if (actual>0)
+				ret = tmpret;
 			if (ret == 0 && actual > 0) {
-				switch (dev->ibuffer[actual - 1]) {
-				case RESP_NACK:
-					/*
-					 * Return ENXIO if NACK was received as
-					 * response to the address phase,
-					 * EIO otherwise
-					 */
-					ret = i == 1 ? -ENXIO : -EIO;
-					break;
-				case RESP_TIMEOUT:
+				if ( dev->check_ack!=0 && (dev->ibuffer[actual -1 ] & 0x80) !=0) { //detect chip write len 0
+					return -EIO;
+				}
+				switch (dev->ibuffer[actual - 1]&0x80) {
+				
+				/*case RESP_TIMEOUT:
 					ret = -ETIMEDOUT;
 					break;
 				case RESP_OK:
-					/* strip off return code */
 					ret = actual - 1;
-					break;
+					break;*/
 				default:
-					ret = -EIO;
+					ret = 0;
+					dev->ilen=actual;
 					break;
 				}
 			}
@@ -239,132 +241,87 @@ dev_info(&dev->interface->dev,"ret write=%d act=%d \n",ret,actual);
 	}
 	dev->olen = 0;
 	dev->ocount = 0;
-	dev->ilen = 0;
+	//dev->ilen = 0;
 //dev_info(&dev->interface->dev,"ret ret=%d act=%d",ret,actual);
 	return ret;
 }
 
-static int ch341_write_cmd(struct i2c_ch341_u2c *dev, bool flush)
-{
-	//dev_info(&dev->interface->dev,"%s",__FUNCTION__);
-	if (flush || dev->olen >= DIOLAN_FLUSH_LEN)
-		return ch341_usb_transfer(dev);
-	return 0;
-}
+
 /* Send command (no data) */
-static int ch341_usb_cmd_msg(struct i2c_ch341_u2c *dev, u8* msg,u8 len, bool flush)
+static int ch341_usb_cmd_msg(struct i2c_ch341_u2c *dev, u8* msg,u8 len)
 {
 	//dev_info(&dev->interface->dev,"%s",__FUNCTION__);
 	memcpy(dev->obuffer,msg,len);
 	dev->olen=len;
 	dev->ocount++;
-	return ch341_write_cmd(dev, flush);
+	return ch341_usb_transfer(dev);
 }
 
 
-static int ch341_usb_cmd_read_addr(struct i2c_ch341_u2c *dev, u8 addr,u8* data,u8 datalen,u8 ilen ){
-	u8 msg[]={
-		mCH341A_CMD_I2C_STREAM,
-		mCH341A_CMD_I2C_STM_STA,
-		mCH341A_CMD_I2C_STM_OUT |1, // 1 byte
-		addr | 0x01,
-	mCH341A_CMD_I2C_STM_IN|ilen,
-	mCH341A_CMD_I2C_STM_STO,
-	mCH341A_CMD_I2C_STM_END,
-	};
-	int msgsize=4+3;
-	
-	//dev_info(&dev->interface->dev,"%s",__FUNCTION__);
-	dev->ilen=ilen;
-	
-	return ch341_usb_cmd_msg(dev,msg,msgsize, true);
+static int ch341_usb_cmd_read_addr(struct i2c_ch341_u2c *dev, u8 addr,u8* data,u16* datalen){
+	u8 msg0[256];
+	int msgsize=0,ret,ilen=*datalen;
+	msg0[msgsize++]=	mCH341A_CMD_I2C_STREAM;
+	msg0[msgsize++]=	mCH341A_CMD_I2C_STM_STA;
+	msg0[msgsize++]=	mCH341A_CMD_I2C_STM_OUT |2; // 1 bytE
+	msg0[msgsize++]=	(addr ) &0xfe;
+	//msg0[msgsize++]= *datalen>0?data[0]:0;
+	msg0[msgsize++]=0;
+	msg0[msgsize++]=mCH341A_CMD_I2C_STM_STA;
+	//msg0[msgsize++]=mCH341A_CMD_I2C_STM_MS | 20;
+	msg0[msgsize++]=mCH341A_CMD_I2C_STM_OUT|1;
+	msg0[msgsize++]=(addr | 0x01);
+	for (;ilen>0;ilen--){
+		msg0[msgsize++]=mCH341A_CMD_I2C_STM_IN|(ilen-1);
+	}
+	//msg0[msgsize++]=mCH341A_CMD_I2C_STM_IN|*datalen;
+	msg0[msgsize++]=mCH341A_CMD_I2C_STM_STO;
+	msg0[msgsize++]=mCH341A_CMD_I2C_STM_END;
+
+	//dev->ilen=ilen;
+		print_hex_dump_bytes("to read ",DUMP_PREFIX_NONE,msg0,msgsize);
+		ret=ch341_usb_cmd_msg(dev,msg0,msgsize);
+		print_hex_dump_bytes("after read ",DUMP_PREFIX_NONE,dev->ibuffer,dev->ilen);
+		//*datalen=1;
+		dev_info(&dev->interface->dev,"after read=%d len=%d",ret,dev->ilen);
+		
+		*datalen=dev->ilen;
+		if (ret>=0)
+			memcpy(data,dev->ibuffer,dev->ilen);
+		return ret;
+
 }
 static int ch341_usb_cmd_write_addr(struct i2c_ch341_u2c *dev, u8 addr,u8 *data, u8 datalen ){
-	u8 msg[256]={
-		mCH341A_CMD_I2C_STREAM,
-		mCH341A_CMD_I2C_STM_STA,
-		mCH341A_CMD_I2C_STM_OUT| datalen, // 1 byte
-		addr & 0xfe,
-	};
-	int msgsize=4+2+datalen;
-	memcpy(msg+4,data,datalen);
+		u8 msg0[256];//={
+	//}; 
+	int msgsize=0;
+	msg0[msgsize++]=mCH341A_CMD_I2C_STREAM,
+	msg0[msgsize++]=mCH341A_CMD_I2C_STM_STA,
+	msg0[msgsize++]=	mCH341A_CMD_I2C_STM_OUT |(datalen+1), // 1 byte
+	msg0[msgsize++]=	(addr ) & 0xfe,
+	dev->check_ack=!datalen;
+	memcpy(msg0+msgsize,data,datalen);
+	msgsize+=datalen;
 	
-	msg[msgsize-2]=mCH341A_CMD_I2C_STM_STO;
-	msg[msgsize-1]=mCH341A_CMD_I2C_STM_END;
-	dev->ilen=datalen+1;
-	//dev_info(&dev->interface->dev,"%s",__FUNCTION__);
-	return ch341_usb_cmd_msg(dev,msg,7, true);
+	msg0[msgsize++]=mCH341A_CMD_I2C_STM_STO;
+	msg0[msgsize++]=mCH341A_CMD_I2C_STM_END;
+	//dev->ilen=0;
+	
+	//print_hex_dump_bytes("to write ",DUMP_PREFIX_NONE,msg0,msgsize);
+	return ch341_usb_cmd_msg(dev,msg0,msgsize);
+	
 }
-/*
- * Flush input queue.
- * If we don't do this at startup and the controller has queued up
- * messages which were not retrieved, it will stop responding
- * at some point.
- */
-static void ch341_flush_input(struct i2c_ch341_u2c *dev)
-{
-	int i;
-
-	//dev_info(&dev->interface->dev,"%s",__FUNCTION__);
-	for (i = 0; i < 10; i++) {
-		int actual = 0;
-		int ret;
-
-		ret = usb_bulk_msg(dev->usb_dev,
-				   usb_rcvbulkpipe(dev->usb_dev, dev->ep_in),
-				   dev->ibuffer, sizeof(dev->ibuffer), &actual,
-				   DEFAULT_TIMEOUT);
-		if (ret < 0 || actual == 0)
-			break;
-	}
-	if (i == 10)
-		dev_err(&dev->interface->dev, "Failed to flush input buffer\n");
-}
-
-static int ch341_i2c_start(struct i2c_ch341_u2c *dev)
-{
-	u8 msg[]={
-		mCH341A_CMD_I2C_STREAM,
-		mCH341A_CMD_I2C_STM_STA,
-		mCH341A_CMD_I2C_STM_END
-	};
-	//dev_info(&dev->interface->dev,"%s",__FUNCTION__);
-	return ch341_usb_cmd_msg(dev,msg,3, true);
-}
-
-static int ch341_i2c_repeated_start(struct i2c_ch341_u2c *dev)
-{
-	u8 msg[]={
-		mCH341A_CMD_I2C_STREAM,
-		mCH341A_CMD_I2C_STM_STA,
-		mCH341A_CMD_I2C_STM_END
-	};
-	//dev_info(&dev->interface->dev,"%s",__FUNCTION__);
-	return ch341_usb_cmd_msg(dev,msg,3, true);
-}
-
-static int ch341_i2c_stop(struct i2c_ch341_u2c *dev)
-{
-	u8 msg[]={
-		mCH341A_CMD_I2C_STREAM,
-		mCH341A_CMD_I2C_STM_STO,
-		mCH341A_CMD_I2C_STM_END
-	};
-	//dev_info(&dev->interface->dev,"%s",__FUNCTION__);
-	return ch341_usb_cmd_msg(dev,msg,3, true);
-}
-
 
 
 static int ch341_set_speed(struct i2c_ch341_u2c *dev, u8 speed)
 {
 	u8 msg[]={
 		mCH341A_CMD_I2C_STREAM,
-		mCH341A_CMD_I2C_STM_SET & (speed & 0x03),
+		mCH341A_CMD_I2C_STM_SET | (speed & 0x03),
 		mCH341A_CMD_I2C_STM_END
 	};
 	dev_info(&dev->interface->dev,"%s",__FUNCTION__);
-	return ch341_usb_cmd_msg(dev,msg,3, true);
+	return ch341_usb_cmd_msg(dev,msg,3);
 }
 
 
@@ -372,7 +329,6 @@ static int ch341_init(struct i2c_ch341_u2c *dev)
 {
 	int speed, freq,ret;
 	dev_info(&dev->interface->dev,"%s",__FUNCTION__);
-
 	if (frequency >= 750000) {
 		speed = CH341_I2C_HIGH_SPEED;
 		freq=frequency;
@@ -397,8 +353,7 @@ static int ch341_init(struct i2c_ch341_u2c *dev)
 	dev_info(&dev->interface->dev,"rest set speed=%d",ret);
 	if (ret < 0)
 		return ret;
-	ch341_flush_input(dev);
-
+	//ch341_flush_input(dev);
 	dev_info(&dev->interface->dev,"all done set speed=%d",ret);
 	return ret;
 }
@@ -410,51 +365,48 @@ static int ch341_usb_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs,
 {
 	struct i2c_ch341_u2c *dev = i2c_get_adapdata(adapter);
 	struct i2c_msg *pmsg;
-	int i,j ;
-	int ret, sret;
+	int i,ret;
 
-	ret = ch341_i2c_start(dev);
-	if (ret < 0)
-		return ret;
-
+		//dev_info(&dev->interface->dev,"new read num=%x",num);
+//ch341_i2c_start(dev);
 	for (i = 0; i < num; i++) {
 		pmsg = &msgs[i];
-		/*if (i) {
-			ret = ch341_i2c_repeated_start(dev);
-			if (ret < 0)
-				goto abort;
-		}*/
-		dev_info(&dev->interface->dev,"read flags=%x",pmsg->flags);
+
+		//dev_info(&dev->interface->dev,"read flags=%x",pmsg->flags);
 		if (pmsg->flags & I2C_M_RD) {
-			dev_info(&dev->interface->dev,"read addr=%d len=%d data0=%x",pmsg->addr,pmsg->len,pmsg->len>0?pmsg->buf[0]:-1);
-			ret=ch341_usb_cmd_read_addr(dev,pmsg->addr<<1 ,pmsg->buf,pmsg->len,1);
+			dev_info(&dev->interface->dev,"read addr=%x len=%d data0=%x",pmsg->addr,pmsg->len,pmsg->len>0?pmsg->buf[0]:-1);
+			ret=ch341_usb_cmd_read_addr(dev,pmsg->addr<<1 ,pmsg->buf,&pmsg->len);
+			//dev_info(&dev->interface->dev,"read addr=%x len=%d data0=%x",pmsg->buf,pmsg->len,pmsg->len>0?pmsg->buf);
+			print_hex_dump_bytes("ibuffer ",DUMP_PREFIX_NONE,pmsg->buf,pmsg->len);
 			if (ret < 0)
 				goto abort;
-			for (j = 0; j < pmsg->len; j++) {
+			/*for (j = 0; j < pmsg->len; j++) {
 				u8 byte;
 				
 				if (j == 0 && (pmsg->flags & I2C_M_RECV_LEN)) {
-					if (byte == 0
-					    || byte > I2C_SMBUS_BLOCK_MAX) {
+					if ( //byte == 0 ||
+					    byte > I2C_SMBUS_BLOCK_MAX) {
 						ret = -EPROTO;
 						goto abort;
 					}
-					pmsg->len += byte;
+					//pmsg->len += byte;
 				}
-				pmsg->buf[j] = byte;
-			}
+				//pmsg->buf[j] = byte;
+			}*/
+			//pmsg->buf[0]=0x01;
+			//pmsg->len=1;
 		} else {
-	dev_info(&dev->interface->dev,"write addr=%d len=%d data0=%x",pmsg->addr,pmsg->len,pmsg->len>0?pmsg->buf[0]:-1);
-			ret = ch341_usb_cmd_write_addr(dev,pmsg->addr<<1 ,pmsg->buf,pmsg->len);
+	//dev_info(&dev->interface->dev,"write addr=%x len=%d data0=%x",pmsg->addr,pmsg->len,pmsg->len>0?pmsg->buf[0]:-1);
+			ret = ch341_usb_cmd_write_addr(dev,pmsg->addr <<1,pmsg->buf,pmsg->len);
+			//dev_info(&dev->interface->dev,"i2c ret after write=%d",ret);
 			if (ret < 0)
 				goto abort;
 		}
 	}
 	ret = num;
 abort:
-	sret = ch341_i2c_stop(dev);
-	if (sret < 0 && ret >= 0)
-		ret = sret;
+//	ch341_i2c_stop(dev);
+//dev_info(&dev->interface->dev,"i2c ret=%d",ret);
 	return ret;
 }
 
@@ -463,8 +415,8 @@ abort:
  */
 static u32 ch341_usb_func(struct i2c_adapter *a)
 {
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL |
-	       I2C_FUNC_SMBUS_READ_BLOCK_DATA | I2C_FUNC_SMBUS_BLOCK_PROC_CALL;
+	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL ;//|
+	      /* I2C_FUNC_SMBUS_READ_BLOCK_DATA |*//* I2C_FUNC_SMBUS_BLOCK_PROC_CALL*/;
 }
 
 static const struct i2c_algorithm ch341_usb_algorithm = {
@@ -560,11 +512,11 @@ static int ch341_u2c_probe(struct usb_interface *interface,
 	dev->adapter.dev.parent = &dev->interface->dev;
 	/* initialize ch341 i2c interface */
 	ret = ch341_init(dev);
+	
 	if (ret < 0) {
 		dev_err(&interface->dev, "failed to initialize adapter\n");
 		goto error_free;
 	}
-
 	/* and finally attach to i2c layer */
 	ret = i2c_add_adapter(&dev->adapter);
 	if (ret < 0) {
