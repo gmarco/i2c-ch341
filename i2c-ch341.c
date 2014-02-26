@@ -209,25 +209,25 @@ static int ch341_usb_transfer(struct i2c_ch341_u2c *dev)
 					      sizeof(dev->ibuffer), &actual,
 					      DEFAULT_TIMEOUT);
 			//print_hex_dump_bytes("ibuffer ",DUMP_PREFIX_NONE,dev->ibuffer,actual);
-			dev_info(&dev->interface->dev,"after read %d %d ",tmpret,actual);
+			dev_info(&dev->interface->dev,"after read %d %d (ret was %d) \n",tmpret,actual,ret);
 
 			/*
 			 * Stop command processing if a previous command
 			 * returned an error.
 			 * Note that we still need to retrieve all messages.
 			 */
-			dev_info(&dev->interface->dev,"obuffer[0]=%02x =%02x (len=%d)",dev->obuffer[0],dev->obuffer[1]&0xf0,dev->olen);
+			dev_info(&dev->interface->dev,"obuffer[0]=%02x =%02x (len=%d) ibuffer[0]=%02x",dev->obuffer[0],dev->obuffer[1]&0xf0,dev->olen,dev->ibuffer[0]);
 			if (dev->olen>1 && dev->obuffer[0]==0xaa && dev->obuffer[1]==0x60 ) {
 				return 0; // set speed should not fail
 			}
 			//if (actual>0)
 				ret = tmpret;
 				//dev->ilen=actual;
+			if ( dev->check_ack==0 && (dev->ibuffer[0 ] & 0x80) !=0) { //detect chip write len 0
+					dev_info(&dev->interface->dev,"_nackonly %d ",-EIO);
+				return -EIO;
+			}
 			if (ret == 0 && actual > 0 ) {
-				if ( dev->check_ack==0 && (dev->ibuffer[actual -1 ] & 0x80) !=0) { //detect chip write len 0
-						dev_info(&dev->interface->dev,"_nackonly %d ",-EIO);
-					return -EIO;
-				}
 				dev_info(&dev->interface->dev,"__ibuf 0=%02x 1=%02x  ",dev->ibuffer[0],dev->ibuffer[1]);
 				ret=actual;
 				dev->ilen=actual;
@@ -274,16 +274,9 @@ static int ch341_usb_cmd_read_addr(struct i2c_ch341_u2c *dev, u8 addr,u8* data,b
 	msg0[msgsize++]=	mCH341A_CMD_I2C_STM_STA;
 	msg0[msgsize++]=	mCH341A_CMD_I2C_STM_OUT |(recv_len?1:0); // 1 bytE
 	msg0[msgsize++]=	(addr ) |0x01 ;//&0xfe;
-	if (recv_len || 1){
-		//msg0[msgsize++]=0;
-		//msg0[msgsize++]=mCH341A_CMD_I2C_STM_STA;
-		//msg0[msgsize++]=mCH341A_CMD_I2C_STM_MS | 20;
-	//	msg0[msgsize++]=	mCH341A_CMD_I2C_STM_OUT |1; // 1 bytE
-	//	msg0[msgsize++]=(addr | 0x01);
-		msg0[msgsize++]=mCH341A_CMD_I2C_STM_IN|ilen ;//(ilen);
-		for (;ilen>0 && 0 ;ilen--){
-			msg0[msgsize++]=mCH341A_CMD_I2C_STM_IN|(ilen-1);
-		}
+	
+	for (;ilen>0  ;ilen--){
+		msg0[msgsize++]=mCH341A_CMD_I2C_STM_IN|(ilen-1);
 	}
 	//msg0[msgsize++]=mCH341A_CMD_I2C_STM_IN|*datalen;
 	msg0[msgsize++]=mCH341A_CMD_I2C_STM_STO;
@@ -308,13 +301,13 @@ static int ch341_usb_cmd_write_addr(struct i2c_ch341_u2c *dev, u8 addr,u8 *data,
 	//return -1;
 		u8 msg0[256];//={
 	//}; 
-	int msgsize=0;
+	int msgsize=0,ret=-5;
 	dev_info(&dev->interface->dev," write len=%d",datalen);
 	msg0[msgsize++]=mCH341A_CMD_I2C_STREAM,
 	msg0[msgsize++]=mCH341A_CMD_I2C_STM_STA,
-	msg0[msgsize++]=	mCH341A_CMD_I2C_STM_OUT |(datalen+1), // 1 byte
+	msg0[msgsize++]=	mCH341A_CMD_I2C_STM_OUT |(datalen>0?datalen+1:0), // 1 byte
 	msg0[msgsize++]=	addr &0xfe,
-	dev->check_ack=(datalen>0);
+	dev->check_ack=0;//(datalen>0);
 	memcpy(msg0+msgsize,data,datalen);
 	msgsize+=datalen;
 	
@@ -323,8 +316,12 @@ static int ch341_usb_cmd_write_addr(struct i2c_ch341_u2c *dev, u8 addr,u8 *data,
 	//dev->ilen=0;
 	
 	//print_hex_dump_bytes("to write ",DUMP_PREFIX_NONE,msg0,msgsize);
-	ch341_usb_cmd_msg(dev,msg0,msgsize);
-	return 0;
+	ret=ch341_usb_cmd_msg(dev,msg0,msgsize);
+	dev_info(&dev->interface->dev,"after write=%d len=%d",ret,datalen);
+	if (datalen>0 && ret ==-ETIMEDOUT){
+		ret=0;
+	}
+	return ret;
 	
 }
 static int ch341_i2c_start(struct i2c_ch341_u2c *dev)
