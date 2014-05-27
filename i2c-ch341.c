@@ -1,7 +1,7 @@
 /*
- * Driver for the Diolan u2c-12 USB-I2C adapter
+ * Driver for the CH341 USB-I2C adapter
  *
- * Copyright (c) 2010-2011 Ericsson AB
+ * Copyright (c) 2014 Marco Gittler
  *
  * Derived from:
  *  i2c-tiny-usb.c
@@ -24,15 +24,9 @@
 
 #define USB_VENDOR_ID_CH341		0x1a86
 #define USB_DEVICE_ID_CH341_U2C	0x5512
-#define BULK_WRITE_ENDPOINT         0x02
-#define BULK_READ_ENDPOINT          0x82
-#define DEFAULT_INTERFACE           0x00
 
 #define DEFAULT_CONFIGURATION       0x01
 #define DEFAULT_TIMEOUT             100    // 300mS for USB timeouts
-
-// Based on (closed-source) DLL V1.9 for USB by WinChipHead (c) 2005.
-// Supports USB chips: CH341, CH341A
 
 #define                mCH341_PACKET_LENGTH        32
 #define                mCH341_PKT_LEN_SHORT        8
@@ -102,36 +96,9 @@
 #define CH341_I2C_FAST_SPEED 2              // fast speed - 400kHz
 #define CH341_I2C_HIGH_SPEED 3              // high speed - 750kHz
 
-
-/* commands via USB, must match command ids in the firmware */
-#define CMD_I2C_READ		0x01
-#define CMD_I2C_WRITE		0x02
-#define CMD_I2C_SCAN		0x03	/* Returns list of detected devices */
-#define CMD_I2C_RELEASE_SDA	0x04
-#define CMD_I2C_RELEASE_SCL	0x05
-#define CMD_I2C_DROP_SDA	0x06
-#define CMD_I2C_DROP_SCL	0x07
-#define CMD_I2C_READ_SDA	0x08
-#define CMD_I2C_READ_SCL	0x09
-#define CMD_GET_FW_VERSION	0x0a
-#define CMD_GET_SERIAL		0x0b
-#define CMD_I2C_START		0x0c
-#define CMD_I2C_STOP		0x0d
-#define CMD_I2C_REPEATED_START	0x0e
-#define CMD_I2C_PUT_BYTE	0x0f
-#define CMD_I2C_GET_BYTE	0x10
-#define CMD_I2C_PUT_ACK		0x11
-#define CMD_I2C_GET_ACK		0x12
-#define CMD_I2C_PUT_BYTE_ACK	0x13
-#define CMD_I2C_GET_BYTE_ACK	0x14
-#define CMD_I2C_SET_SPEED	0x1b
-#define CMD_I2C_GET_SPEED	0x1c
-#define CMD_I2C_SET_CLK_SYNC	0x24
-#define CMD_I2C_GET_CLK_SYNC	0x25
-#define CMD_I2C_SET_CLK_SYNC_TO	0x26
-#define CMD_I2C_GET_CLK_SYNC_TO	0x27
-
-
+#define U2C_I2C_FREQ_FAST 400000
+#define U2C_I2C_FREQ_STD  100000
+#define U2C_I2C_FREQ(s)   (1000000 / (2 * (s - 1) + 10))
 
 #define RESP_OK			0x00
 #define RESP_FAILED		0x01
@@ -141,26 +108,13 @@
 #define RESP_NACK		0x07
 #define RESP_TIMEOUT		0x09
 
-#define U2C_I2C_SPEED_FAST	0	/* 400 kHz */
-#define U2C_I2C_SPEED_STD	1	/* 100 kHz */
-#define U2C_I2C_SPEED_2KHZ	242	/* 2 kHz, minimum speed */
-#define U2C_I2C_SPEED(f)	((DIV_ROUND_UP(1000000, (f)) - 10) / 2 + 1)
+#define CH341_OUTBUF_LEN	128
+#define CH341_INBUF_LEN	256	/* Maximum supported receive length */
 
-#define U2C_I2C_FREQ_FAST	400000
-#define U2C_I2C_FREQ_STD	100000
-#define U2C_I2C_FREQ(s)		(1000000 / (2 * (s - 1) + 10))
 
-#define DIOLAN_USB_TIMEOUT	100	/* in ms */
-#define DIOLAN_SYNC_TIMEOUT	20	/* in ms */
-
-#define DIOLAN_OUTBUF_LEN	128
-#define DIOLAN_FLUSH_LEN	(DIOLAN_OUTBUF_LEN - 4)
-#define DIOLAN_INBUF_LEN	256	/* Maximum supported receive length */
-
-/* Structure to hold all of our device specific stuff */
 struct i2c_ch341_u2c {
-	u8 obuffer[DIOLAN_OUTBUF_LEN];	/* output buffer */
-	u8 ibuffer[DIOLAN_INBUF_LEN];	/* input buffer */
+	u8 obuffer[CH341_OUTBUF_LEN];	/* output buffer */
+	u8 ibuffer[CH341_INBUF_LEN];	/* input buffer */
 	int ep_in, ep_out;              /* Endpoints    */
 	struct usb_device *usb_dev;	/* the usb device for this device */
 	struct usb_interface *interface;/* the interface for this device */
@@ -278,7 +232,6 @@ static int ch341_usb_cmd_read_addr(struct i2c_ch341_u2c *dev, u8 addr,u8* data,u
 	for (;ilen>0  ;ilen--){
 		msg0[msgsize++]=mCH341A_CMD_I2C_STM_IN|(ilen-1);
 	}
-	//msg0[msgsize++]=mCH341A_CMD_I2C_STM_IN|*datalen;
 	msg0[msgsize++]=mCH341A_CMD_I2C_STM_STO;
 	msg0[msgsize++]=mCH341A_CMD_I2C_STM_END;
 
@@ -292,11 +245,9 @@ static int ch341_usb_cmd_read_addr(struct i2c_ch341_u2c *dev, u8 addr,u8* data,u
 
 }
 static int ch341_usb_cmd_write_addr(struct i2c_ch341_u2c *dev, u8 addr,u8 *data, u8 datalen ){
-	//return -1;
-		u8 msg0[256];//={
-	//}; 
+	u8 msg0[256];
+	
 	int msgsize=0,ret=-5;
-	//dev_info(&dev->interface->dev," write len=%d",datalen);
 	msg0[msgsize++]=mCH341A_CMD_I2C_STREAM,
 	msg0[msgsize++]=mCH341A_CMD_I2C_STM_STA,
 	msg0[msgsize++]=	mCH341A_CMD_I2C_STM_OUT |(datalen>0?datalen+1:0), // 1 byte
@@ -307,11 +258,8 @@ static int ch341_usb_cmd_write_addr(struct i2c_ch341_u2c *dev, u8 addr,u8 *data,
 	
 	msg0[msgsize++]=mCH341A_CMD_I2C_STM_STO;
 	msg0[msgsize++]=mCH341A_CMD_I2C_STM_END;
-	//dev->ilen=0;
 	
-	//print_hex_dump_bytes("to write ",DUMP_PREFIX_NONE,msg0,msgsize);
 	ret=ch341_usb_cmd_msg(dev,msg0,msgsize);
-	//dev_info(&dev->interface->dev,"after write=%d len=%d",ret,datalen);
 	if (datalen>0 && ret ==-ETIMEDOUT){
 		ret=0;
 	}
@@ -348,7 +296,6 @@ static int ch341_set_speed(struct i2c_ch341_u2c *dev, u8 speed)
 		mCH341A_CMD_I2C_STM_SET | (speed & 0x03),
 		mCH341A_CMD_I2C_STM_END
 	};
-	dev_info(&dev->interface->dev,"%s",__FUNCTION__);
 	return ch341_usb_cmd_msg(dev,msg,3);
 }
 
@@ -375,14 +322,10 @@ static int ch341_init(struct i2c_ch341_u2c *dev)
 		 "CH341 U2C at USB bus %03d address %03d speed %d Hz\n",
 		 dev->usb_dev->bus->busnum, dev->usb_dev->devnum,freq);
 
-
 	/* Set I2C speed */
 	ret = ch341_set_speed(dev, speed);
-	dev_info(&dev->interface->dev,"rest set speed=%d",ret);
 	if (ret < 0)
 		return ret;
-	//ch341_flush_input(dev);
-	dev_info(&dev->interface->dev,"all done set speed=%d",ret);
 	return ret;
 }
 
@@ -407,22 +350,6 @@ static int ch341_usb_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs,
 			}
 			if (ret < 0)
 				goto abort;
-			/*for (j = 0; j < pmsg->len; j++) {
-				u8 byte;
-				
-				if (j == 0 && (pmsg->flags & I2C_M_RECV_LEN)) {
-					if ( //byte == 0 ||
-					    byte > I2C_SMBUS_BLOCK_MAX) {
-						ret = -EPROTO;
-						goto abort;
-					}
-					//pmsg->len += byte;
-				}
-				//pmsg->buf[j] = byte;
-			}*/
-			//pmsg->buf[0]=0x01;
-			//pmsg->len=1;
-			//dev_info(&dev->interface->dev,"buf: %02x %d\n",pmsg->buf[0],pmsg->len);
 		} else {
 			ret = ch341_usb_cmd_write_addr(dev,pmsg->addr <<1,pmsg->buf,pmsg->len);
 			if (ret < 0)
@@ -580,6 +507,6 @@ static struct usb_driver ch341_u2c_driver = {
 
 module_usb_driver(ch341_u2c_driver);
 
-MODULE_AUTHOR("Guenter Roeck <linux@roeck-us.net>");
+MODULE_AUTHOR("Marco Gittler <g.marco@freenet.de>");
 MODULE_DESCRIPTION(DRIVER_NAME " driver");
 MODULE_LICENSE("GPL");
