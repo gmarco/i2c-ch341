@@ -26,7 +26,7 @@
 #define USB_DEVICE_ID_CH341_U2C 0x5512
 
 #define DEFAULT_CONFIGURATION       0x01
-#define DEFAULT_TIMEOUT             100    // 300mS for USB timeouts
+#define DEFAULT_TIMEOUT             100    // 100mS for USB timeouts
 
 #define                mCH341_PACKET_LENGTH        32
 #define                mCH341_PKT_LEN_SHORT        8
@@ -130,9 +130,7 @@ static uint frequency = U2C_I2C_FREQ_STD;   /* I2C clock frequency in Hz */
 module_param(frequency, uint, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(frequency, "I2C clock frequency in hertz");
 
-/* usb layer */
 
-/* Send command to device, and get response. */
 static int ch341_usb_transfer(struct i2c_ch341_u2c *dev)
 {
     int ret = 0;
@@ -142,17 +140,13 @@ static int ch341_usb_transfer(struct i2c_ch341_u2c *dev)
     if (!dev->olen || !dev->ocount) {
         return -EINVAL;
     }
-//dev_info(&dev->interface->dev,         "olen=%d ilen=%d, ocount=%d, obufffer=%x %x %x",dev->olen,dev->ilen,dev->ocount,dev->obuffer[0],dev->obuffer[1],dev->obuffer[2]);
-
 
     ret = usb_bulk_msg(dev->usb_dev,
                        usb_sndbulkpipe(dev->usb_dev, dev->ep_out),
                        dev->obuffer, dev->olen, &actual,
                        DEFAULT_TIMEOUT);
-    //print_hex_dump_bytes("obuffer ",DUMP_PREFIX_NONE,dev->obuffer,dev->olen);
-    //  dev_info(&dev->interface->dev,"after write=%d act=%d \n",ret,actual);
+		
     if (!ret) {
-        //usleep_range(30,50);
         dev->ocount = 1;
         for (i = 0; i < dev->ocount; i++) {
             int tmpret;
@@ -163,15 +157,6 @@ static int ch341_usb_transfer(struct i2c_ch341_u2c *dev)
                                   dev->ibuffer,
                                   sizeof(dev->ibuffer), &actual,
                                   DEFAULT_TIMEOUT);
-            //print_hex_dump_bytes("ibuffer ",DUMP_PREFIX_NONE,dev->ibuffer,actual);
-            //dev_info(&dev->interface->dev,"after read %d %d (ret was %d) \n",tmpret,actual,ret);
-
-            /*
-             * Stop command processing if a previous command
-             * returned an error.
-             * Note that we still need to retrieve all messages.
-             */
-            //dev_info(&dev->interface->dev,"obuffer[0]=%02x =%02x (len=%d) ibuffer[0]=%02x",dev->obuffer[0],dev->obuffer[1]&0xf0,dev->olen,dev->ibuffer[0]);
             if (dev->olen > 1 && dev->obuffer[0] == 0xaa && dev->obuffer[1] == 0x60) {
                 return 0; // set speed should not fail
             }
@@ -205,8 +190,6 @@ static int ch341_usb_transfer(struct i2c_ch341_u2c *dev)
     }
     dev->olen = 0;
     dev->ocount = 0;
-    //dev->ilen = 0;
-//dev_info(&dev->interface->dev,"ret ret=%d act=%d",ret,actual);
     return ret;
 }
 
