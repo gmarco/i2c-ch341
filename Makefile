@@ -9,3 +9,7 @@ clean:
 reload:	all
 		sudo rmmod i2c-ch341 ||true
 		sudo insmod ./i2c-ch341.ko 
+test:	reload
+		sudo i2cdetect -y 3 
+#		sudo -i ruby gyro.rb
+	

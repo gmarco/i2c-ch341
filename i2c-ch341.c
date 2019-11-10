@@ -19,6 +19,7 @@
 #include <linux/slab.h>
 #include <linux/usb.h>
 #include <linux/i2c.h>
+#include <linux/mutex.h>
 
 #define DRIVER_NAME     "i2c-ch341-u2c"
 
@@ -91,14 +92,10 @@
 #define                mCH341_PARA_MODE_MEM        0x02
 
 
-#define CH341_I2C_LOW_SPEED 0               // low speed - 20kHz               
+#define CH341_I2C_LOW_SPEED 0               // low speed - 20kHz
 #define CH341_I2C_STANDARD_SPEED 1          // standard speed - 100kHz
 #define CH341_I2C_FAST_SPEED 2              // fast speed - 400kHz
 #define CH341_I2C_HIGH_SPEED 3              // high speed - 750kHz
-
-#define U2C_I2C_FREQ_FAST 400000
-#define U2C_I2C_FREQ_STD  100000
-#define U2C_I2C_FREQ(s)   (1000000 / (2 * (s - 1) + 10))
 
 #define RESP_OK         0x00
 #define RESP_FAILED     0x01
@@ -108,9 +105,10 @@
 #define RESP_NACK       0x07
 #define RESP_TIMEOUT        0x09
 
-#define CH341_OUTBUF_LEN    128
-#define CH341_INBUF_LEN 256 /* Maximum supported receive length */
+#define CH341_OUTBUF_LEN   32
+#define CH341_INBUF_LEN 32 /* Maximum supported receive length */
 
+static struct mutex ch341_lock;
 
 struct i2c_ch341_u2c {
     u8 obuffer[CH341_OUTBUF_LEN];   /* output buffer */
@@ -120,160 +118,140 @@ struct i2c_ch341_u2c {
     struct usb_interface *interface;/* the interface for this device */
     struct i2c_adapter adapter; /* i2c related things */
     int olen;           /* Output buffer length */
-    int ocount;         /* Number of enqueued messages */
     int ilen;
-    int check_ack;
 };
 
-static uint frequency = U2C_I2C_FREQ_STD;   /* I2C clock frequency in Hz */
+static uint frequency = CH341_I2C_LOW_SPEED;   /* I2C clock frequency in Hz */
 
 module_param(frequency, uint, S_IRUGO | S_IWUSR);
-MODULE_PARM_DESC(frequency, "I2C clock frequency in hertz");
+MODULE_PARM_DESC(frequency, "I2C clock frequency (0=20kHz,1=100kHz,2=400kHz,3=750kHz");
 
 
 static int ch341_usb_transfer(struct i2c_ch341_u2c *dev)
 {
     int ret = 0;
     int actual;
-    int i;
 
-    if (!dev->olen || !dev->ocount) {
-        return -EINVAL;
-    }
-
+	mutex_lock(&ch341_lock);
     ret = usb_bulk_msg(dev->usb_dev,
                        usb_sndbulkpipe(dev->usb_dev, dev->ep_out),
                        dev->obuffer, dev->olen, &actual,
                        DEFAULT_TIMEOUT);
-		
-    if (!ret) {
-        dev->ocount = 1;
-        for (i = 0; i < dev->ocount; i++) {
-            int tmpret;
-            memset(dev->ibuffer, 0, 256);
-            tmpret = usb_bulk_msg(dev->usb_dev,
-                                  usb_rcvbulkpipe(dev->usb_dev,
-                                                  dev->ep_in),
-                                  dev->ibuffer,
-                                  sizeof(dev->ibuffer), &actual,
-                                  DEFAULT_TIMEOUT);
-            if (dev->olen > 1 && dev->obuffer[0] == 0xaa && dev->obuffer[1] == 0x60) {
-                return 0; // set speed should not fail
-            }
-            //if (actual>0)
-            ret = tmpret;
-            //dev->ilen=actual;
-            if (dev->check_ack == 0 && (dev->ibuffer[0 ] & 0x80) != 0) { //detect chip write len 0
-                //dev_info(&dev->interface->dev,"_nackonly %d ",-EIO);
-                return -EIO;
-            }
-            if (ret == 0 && actual > 0) {
-                //dev_info(&dev->interface->dev,"__ibuf 0=%02x 1=%02x  ",dev->ibuffer[0],dev->ibuffer[1]);
-                ret = actual;
-                dev->ilen = actual;
-                /*switch (dev->ibuffer[actual - 1]&0x80) {
 
-                case RESP_TIMEOUT:
-                    ret = -ETIMEDOUT;
-                    break;
-                case RESP_OK:
-                    ret = actual - 1;
-                    break;
-                default:
-                    //ret = 0;
-                    dev->ilen=actual;
-                    break;
-                }*/
+	mutex_unlock(&ch341_lock);
 
-            }
-        }
-    }
-    dev->olen = 0;
-    dev->ocount = 0;
-    return ret;
+	if (ret<0)
+		return ret;
+
+	if (dev->ilen==0)
+		return actual;
+
+	mutex_lock(&ch341_lock);
+
+	memset(dev->ibuffer, 0, sizeof(dev->ibuffer));
+	ret = usb_bulk_msg(dev->usb_dev,
+						  usb_rcvbulkpipe(dev->usb_dev,
+										  dev->ep_in),
+						  dev->ibuffer,
+						  sizeof(dev->ibuffer), &actual,
+						  DEFAULT_TIMEOUT);
+	mutex_unlock(&ch341_lock);
+	if (dev->olen > 1 && dev->obuffer[0] == 0xaa && dev->obuffer[1] == 0x60) {
+		return 0; // set speed should not fail
+	}
+
+	if (ret<0)
+		return ret;
+
+  return actual;
 }
 
 
 /* Send command (no data) */
-static int ch341_usb_cmd_msg(struct i2c_ch341_u2c *dev, u8 *msg, u8 len)
+static int ch341_usb_cmd_msg(struct i2c_ch341_u2c *dev, u8 *msg, u8 olen,u8 ilen)
 {
-    //dev_info(&dev->interface->dev,"%s",__FUNCTION__);
-    memcpy(dev->obuffer, msg, len);
-    dev->olen = len;
-    dev->ocount++;
+    memcpy(dev->obuffer, msg, olen);
+    dev->olen = olen;
+  	dev->ilen = ilen;
     return ch341_usb_transfer(dev);
 }
+static int ch341_usb_cmd_check_presence(struct i2c_ch341_u2c *dev, u8 addr) {
+
+  int msgsize = 0, ret=0;
+  uint8_t msg[CH341_INBUF_LEN];
 
 
-static int ch341_usb_cmd_read_addr(struct i2c_ch341_u2c *dev, u8 addr, u8 *data, u8 datalen, bool recv_len)
+  msg[msgsize++] = mCH341A_CMD_I2C_STREAM;
+  msg[msgsize++] = mCH341A_CMD_I2C_STM_STA;
+  msg[msgsize++] = mCH341A_CMD_I2C_STM_OUT;
+  msg[msgsize++] = addr |0x01; // use a read
+  msg[msgsize++] = mCH341A_CMD_I2C_STM_STO;
+  msg[msgsize++] = mCH341A_CMD_I2C_STM_END;
+
+  ret= ch341_usb_cmd_msg(dev,msg,msgsize,1);
+
+  if (ret <0)
+	  return ret;
+
+  if ( dev->ibuffer[0] & 0x80 )
+		return -ETIMEDOUT;
+
+  return 0;
+
+}
+
+static int ch341_usb_cmd_read_addr(struct i2c_ch341_u2c *dev, u8 addr, u8 *data, u8 datalen)
 {
-    u8 msg0[256];
-    int msgsize = 0, ret, ilen = datalen;
+    u8 msg0[CH341_INBUF_LEN];
+    int msgsize = 0, ret,i;
+
     msg0[msgsize++] =    mCH341A_CMD_I2C_STREAM;
     msg0[msgsize++] =    mCH341A_CMD_I2C_STM_STA;
-    msg0[msgsize++] =    mCH341A_CMD_I2C_STM_OUT | (recv_len ? 1 : 0); // 1 bytE
-    msg0[msgsize++] = (addr) | 0x01 ;  //&0xfe;
+    msg0[msgsize++] =    mCH341A_CMD_I2C_STM_OUT |0x01 ; // write addr byte
+    msg0[msgsize++] = (addr) | 0x01 ;  ;
+	if (datalen) {
+		for (i=0;i< datalen ;i++){
+			msg0[msgsize++] = mCH341A_CMD_I2C_STM_IN | 1;
+		}
+		msg0[msgsize++] = mCH341A_CMD_I2C_STM_IN ;
 
-    for (; ilen > 0  ; ilen--) {
-        msg0[msgsize++] = mCH341A_CMD_I2C_STM_IN | (ilen - 1);
-    }
+	}
     msg0[msgsize++] = mCH341A_CMD_I2C_STM_STO;
     msg0[msgsize++] = mCH341A_CMD_I2C_STM_END;
 
-    dev->check_ack = recv_len;
-    ret = ch341_usb_cmd_msg(dev, msg0, msgsize);
+    ret = ch341_usb_cmd_msg(dev, msg0, msgsize, datalen);
 
     if (ret >= 0) {
-        memcpy(data, dev->ibuffer + (recv_len ? 0 : 1), dev->ilen - (recv_len ? 1 : 0));
+        memcpy(data, dev->ibuffer , dev->ilen );
     }
     return ret;
 
 }
 static int ch341_usb_cmd_write_addr(struct i2c_ch341_u2c *dev, u8 addr, u8 *data, u8 datalen)
 {
-    u8 msg0[256];
+    u8 msg0[CH341_INBUF_LEN];
 
     int msgsize = 0, ret = -5;
-    msg0[msgsize++] = mCH341A_CMD_I2C_STREAM,
-                      msg0[msgsize++] = mCH341A_CMD_I2C_STM_STA,
-                                        msg0[msgsize++] =    mCH341A_CMD_I2C_STM_OUT | (datalen > 0 ? datalen + 1 : 0), // 1 byte
-                                                msg0[msgsize++] =    addr & 0xfe,
-                                                        dev->check_ack = 0; //(datalen>0);
-    memcpy(msg0 + msgsize, data, datalen);
-    msgsize += datalen;
 
-    msg0[msgsize++] = mCH341A_CMD_I2C_STM_STO;
-    msg0[msgsize++] = mCH341A_CMD_I2C_STM_END;
+    if (datalen){
+		msg0[msgsize++] = mCH341A_CMD_I2C_STREAM;
+		msg0[msgsize++] = mCH341A_CMD_I2C_STM_STA;
+		msg0[msgsize++] = mCH341A_CMD_I2C_STM_OUT | ( datalen + 1 ); // addr byte + len
+		msg0[msgsize++] =    addr & 0xfe;
 
-    ret = ch341_usb_cmd_msg(dev, msg0, msgsize);
-    if (datalen > 0 && ret == -ETIMEDOUT) {
-        ret = 0;
-    }
-    return ret;
+		memcpy(msg0 + msgsize, data, datalen);
+		msgsize += datalen;
+
+		msg0[msgsize++] = mCH341A_CMD_I2C_STM_STO;
+		msg0[msgsize++] = mCH341A_CMD_I2C_STM_END;
+
+		ret = ch341_usb_cmd_msg(dev, msg0, msgsize,0);
+		return ret;
+	}
+	return -EIO;
 
 }
-/*
-static int ch341_i2c_start(struct i2c_ch341_u2c *dev)
-{
-    u8 msg[]={
-        mCH341A_CMD_I2C_STREAM,
-        mCH341A_CMD_I2C_STM_STA,
-        mCH341A_CMD_I2C_STM_END
-    };
-    dev_info(&dev->interface->dev,"%s",__FUNCTION__);
-    return ch341_usb_cmd_msg(dev,msg,3);
-}
-static int ch341_i2c_stop(struct i2c_ch341_u2c *dev)
-{
-    u8 msg[]={
-        mCH341A_CMD_I2C_STREAM,
-        mCH341A_CMD_I2C_STM_STO,
-        mCH341A_CMD_I2C_STM_END
-    };
-    dev_info(&dev->interface->dev,"%s",__FUNCTION__);
-    return ch341_usb_cmd_msg(dev,msg,3);
-}
-*/
+
 
 static int ch341_set_speed(struct i2c_ch341_u2c *dev, u8 speed)
 {
@@ -282,31 +260,26 @@ static int ch341_set_speed(struct i2c_ch341_u2c *dev, u8 speed)
         mCH341A_CMD_I2C_STM_SET | (speed & 0x03),
         mCH341A_CMD_I2C_STM_END
     };
-    return ch341_usb_cmd_msg(dev, msg, 3);
+    return ch341_usb_cmd_msg(dev, msg, 3,0);
 }
 
 
 static int ch341_init(struct i2c_ch341_u2c *dev)
 {
-    int speed, freq, ret;
-    dev_info(&dev->interface->dev, "%s", __FUNCTION__);
-    if (frequency >= 750000) {
-        speed = CH341_I2C_HIGH_SPEED;
-        freq = frequency;
-    } else if (frequency >= 400000) {
+    int speed, ret;
+    int speeds[4]={20,100,400,750};
+
+    //dev_info(&dev->interface->dev, "%s", __FUNCTION__);
+
+    if (frequency >CH341_I2C_FAST_SPEED) {
         speed = CH341_I2C_FAST_SPEED;
-        freq = frequency;
-    } else if (frequency >= 200000 || frequency == 0) {
-        speed = CH341_I2C_STANDARD_SPEED;
-        freq = frequency;
     } else {
-        speed = CH341_I2C_LOW_SPEED;
-        freq = frequency;
+        speed = frequency & 0x03;
     }
 
     dev_info(&dev->interface->dev,
-             "CH341 U2C at USB bus %03d address %03d speed %d Hz\n",
-             dev->usb_dev->bus->busnum, dev->usb_dev->devnum, freq);
+             "CH341 U2C at USB bus %03d address %03d speed %d kHz\n",
+             dev->usb_dev->bus->busnum, dev->usb_dev->devnum, speeds[speed]);
 
     /* Set I2C speed */
     ret = ch341_set_speed(dev, speed);
@@ -321,34 +294,35 @@ static int ch341_init(struct i2c_ch341_u2c *dev)
 static int ch341_usb_xfer(struct i2c_adapter *adapter, struct i2c_msg *msgs,
                           int num)
 {
-    struct i2c_ch341_u2c *dev = i2c_get_adapdata(adapter);
-    struct i2c_msg *pmsg;
-    int i, ret;
+  struct i2c_ch341_u2c *dev = i2c_get_adapdata(adapter);
+  struct i2c_msg *pmsg;
+  int i, ret;
 
-    for (i = 0; i < num; i++) {
-        pmsg = &msgs[i];
+  ret = ch341_usb_cmd_check_presence(dev, msgs[0].addr << 1 );
 
-        if (pmsg->flags & I2C_M_RD) {
-            int recv_len = pmsg->flags & I2C_M_RECV_LEN;
-            dev->ilen = recv_len;
-            ret = ch341_usb_cmd_read_addr(dev, pmsg->addr << 1 , pmsg->buf, pmsg->len, recv_len);
-            if (recv_len && ret > 0) {
-                pmsg->len = ret;
-            }
-            if (ret < 0) {
-                goto abort;
-            }
-        } else {
-            ret = ch341_usb_cmd_write_addr(dev, pmsg->addr << 1, pmsg->buf, pmsg->len);
-            if (ret < 0) {
-                goto abort;
-            }
-        }
-    }
-    ret = num;
+  if (ret< 0 )
+	return ret;
+
+  for (i = 0; i < num && msgs[0].len; i++) {
+      pmsg = &msgs[i];
+
+      if (pmsg->flags & I2C_M_RD) {
+          ret = ch341_usb_cmd_read_addr(dev, pmsg->addr << 1 , pmsg->buf, pmsg->len);
+
+          if (ret < 0) {
+              goto abort;
+          }
+      } else {
+          ret = ch341_usb_cmd_write_addr(dev, pmsg->addr << 1, pmsg->buf, pmsg->len);
+          if (ret < 0) {
+              goto abort;
+          }
+      }
+  }
+  ret = num;
 abort:
-    //ch341_i2c_stop(dev);
-    return (ret < 0) ? ret : num;
+  return ret ;
+
 }
 
 /*
@@ -356,8 +330,8 @@ abort:
  */
 static u32 ch341_usb_func(struct i2c_adapter *a)
 {
-    return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL ;/*|
-           I2C_FUNC_SMBUS_READ_BLOCK_DATA | I2C_FUNC_SMBUS_BLOCK_PROC_CALL;*/
+    return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL ;
+
 }
 
 static const struct i2c_algorithm ch341_usb_algorithm = {
@@ -403,9 +377,9 @@ static int ch341_u2c_probe(struct usb_interface *interface,
         goto error;
     }
     dev->ep_out = hostif->endpoint[1].desc.bEndpointAddress;
-    dev_info(&interface->dev, "ep_out=%x\n", dev->ep_out);
+    //dev_info(&interface->dev, "ep_out=%x\n", dev->ep_out);
     dev->ep_in = hostif->endpoint[0].desc.bEndpointAddress;
-    dev_info(&interface->dev, "ep_in=%x\n", dev->ep_in);
+    //dev_info(&interface->dev, "ep_in=%x\n", dev->ep_in);
 
     dev->usb_dev = usb_get_dev(interface_to_usbdev(interface));
     dev->interface = interface;
@@ -488,15 +462,29 @@ static void ch341_u2c_disconnect(struct usb_interface *interface)
     dev_dbg(&interface->dev, "disconnected\n");
 }
 
+static int ch341_u2c_suspend(struct usb_interface *intf, pm_message_t message )
+{
+	return 0;
+}
+
+static int ch341_u2c_resume( struct usb_interface *intf )
+{
+	return 0;
+}
+
+
 static struct usb_driver ch341_u2c_driver = {
     .name = DRIVER_NAME,
     .probe = ch341_u2c_probe,
     .disconnect = ch341_u2c_disconnect,
     .id_table = ch341_u2c_table,
+    .supports_autosuspend = 1,
+    .suspend	= ch341_u2c_suspend,
+    .resume		= ch341_u2c_resume,
 };
 
 module_usb_driver(ch341_u2c_driver);
 
-MODULE_AUTHOR("Marco Gittler <g.marco@freenet.de>");
-MODULE_DESCRIPTION(DRIVER_NAME " driver");
+MODULE_AUTHOR("Marco Gittler <git.marco@gmail.com>");
+MODULE_DESCRIPTION(DRIVER_NAME " ch341driver");
 MODULE_LICENSE("GPL");
